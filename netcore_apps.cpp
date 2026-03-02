@@ -24,6 +24,9 @@
 #include "svc_tempir.h"
 #include "svc_rfid.h"
 
+#include "svc_keyboard.h"
+#include "svc_ble.h"
+
 #include <Arduino.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -209,6 +212,10 @@ static int s_wifiPrevSel=-1, s_wifiPrevTop=-1, s_wifiPrevCount=-1;
 static int s_wifiPrevScanning=-1;
 static WifiSvcState s_wifiPrevState = WSVC_OFF;
 
+static bool s_wifiSavedView = false;
+static char s_wifiSelSsid[WIFI_SVC_SSID_LEN] = {0};
+static char s_wifiPass[64] = {0};
+
 static void wifiRenderAll() {
   char st[64];
   const char* stateStr = "OFF";
@@ -221,24 +228,48 @@ static void wifiRenderAll() {
     case WSVC_RETRY_WAIT:  stateStr = "RETRY"; break;
     default: break;
   }
-  snprintf(st, sizeof(st), "%s  %d nets", stateStr, wifiSvcScanCount());
-  drawLine(0, false, st);
 
-  int count = wifiSvcScanCount();
-  for (int r = 0; r < VISIBLE_ROWS - 1; r++) {
-    int idx = s_wifiTop + r;
-    if (idx < 0 || idx >= count) {
-      drawLine(r + 1, false, "");
-      continue;
+  if (!s_wifiSavedView) {
+    snprintf(st, sizeof(st), "%s  %d nets", stateStr, wifiSvcScanCount());
+  } else {
+    snprintf(st, sizeof(st), "%s  SAVED", stateStr);
+  }
+  drawLine(0, (s_wifiSel == -1), st);
+
+  if (!s_wifiSavedView) {
+    int count = wifiSvcScanCount();
+    for (int r = 0; r < VISIBLE_ROWS - 1; r++) {
+      int idx = s_wifiTop + r;
+      if (idx < 0 || idx >= count) {
+        drawLine(r + 1, false, "");
+        continue;
+      }
+      const WifiSvcNet* net = wifiSvcScanResult(idx);
+      char row[48];
+      if (net) {
+        const char* lock = (net->auth == WIFI_AUTH_OPEN) ? " " : "*";
+        snprintf(row, sizeof(row), "%s%s (%lddBm)", lock, net->ssid, (long)net->rssi);
+      } else {
+        snprintf(row, sizeof(row), "<?>");
+      }
+      drawLine(r + 1, idx == s_wifiSel, row);
     }
-    const WifiSvcNet* net = wifiSvcScanResult(idx);
-    char row[48];
-    if (net) {
-      snprintf(row, sizeof(row), "%s (%lddBm)", net->ssid, (long)net->rssi);
+  } else {
+    if (wifiSvcHasSavedCreds()) {
+      char l1[48];
+      snprintf(l1, sizeof(l1), "SSID: %s", wifiSvcGetSavedSSID());
+      drawLine(1, false, l1);
+      drawLine(2, (s_wifiSel == 0), "Connect saved");
+      drawLine(3, (s_wifiSel == 1), "Forget saved");
     } else {
-      snprintf(row, sizeof(row), "<?>");
+      drawLine(1, false, "SSID: (none)");
+      drawLine(2, false, "Select secured net");
+      drawLine(3, false, "to enter pass");
     }
-    drawLine(r + 1, idx == s_wifiSel, row);
+    drawLine(4, false, "SEL on header: back");
+    drawLine(5, false, "");
+    drawLine(6, false, "");
+    drawLine(7, false, "");
   }
 
   s_wifiPrevSel = s_wifiSel;
@@ -252,6 +283,9 @@ static void appWifiEnter() {
   appChromeEnter("WIFI", "SCAN", "BACK menu");
   s_wifiSel = 0; s_wifiTop = 0;
   s_wifiPrevSel = -1; s_wifiPrevTop = -1; s_wifiPrevCount = -1; s_wifiPrevScanning = -1;
+  s_wifiSavedView = false;
+  s_wifiSelSsid[0] = 0;
+  s_wifiPass[0] = 0;
 
   if (!taskIsRunning()) {
     taskRun(TASK_WIFI_SCAN, nullptr);
@@ -263,22 +297,86 @@ static void appWifiEnter() {
 }
 
 static void appWifiTick() {
+  // Keyboard overlay (password entry)
+  if (kbActive()) {
+    kbTick();
+    if (kbFinished()) {
+      wifiSvcConnect(s_wifiSelSsid, s_wifiPass);
+      notifySvcPost(NOTIFY_INFO, "WIFI", "Connect...", 1200);
+      wifiRenderAll();
+    } else if (kbCancelled()) {
+      notifySvcPost(NOTIFY_WARN, "WIFI", "Cancelled", 1000);
+      wifiRenderAll();
+    }
+    return;
+  }
+
+  // BLE provision hook (compile-safe; usually false in Wokwi)
+  {
+    char ssid[WIFI_SVC_SSID_LEN] = {0};
+    char pass[64] = {0};
+    bool connectNow = false;
+    if (bleWifiProvisionPop(ssid, (int)sizeof(ssid), pass, (int)sizeof(pass), &connectNow)) {
+      if (connectNow) wifiSvcConnect(ssid, pass);
+      notifySvcPost(NOTIFY_INFO, "BLE", "WiFi creds rx", 1200);
+      wifiRenderAll();
+      return;
+    }
+  }
+
+  // Rescan on long select
   if (inputHoldSelect()) {
     if (!taskIsRunning()) taskRun(TASK_WIFI_SCAN, nullptr);
     notifySvcPost(NOTIFY_INFO, "WIFI", "Rescan", 1200);
   }
 
   int count = wifiSvcScanCount();
-  if (Buttons::up::consume()) { if (s_wifiSel > 0) s_wifiSel--; }
-  if (Buttons::down::consume()) { if (s_wifiSel < count-1) s_wifiSel++; }
+  if (count < 0) count = 0;
+  int maxSel = s_wifiSavedView ? 1 : (count - 1);
 
-  int win = VISIBLE_ROWS-1;
-  if (s_wifiSel < s_wifiTop) s_wifiTop = s_wifiSel;
-  if (s_wifiSel >= s_wifiTop + win) s_wifiTop = s_wifiSel - (win-1);
-  if (s_wifiTop < 0) s_wifiTop = 0;
+  // Allow header selection (-1) to toggle saved view
+  if (Buttons::up::consume()) {
+    if (s_wifiSel > -1) s_wifiSel--;
+  }
+  if (Buttons::down::consume()) {
+    if (s_wifiSel < maxSel) s_wifiSel++;
+  }
+
+  // Scroll window (scan view only)
+  if (!s_wifiSavedView) {
+    int win = VISIBLE_ROWS-1;
+    if (s_wifiSel < s_wifiTop) s_wifiTop = s_wifiSel;
+    if (s_wifiSel >= s_wifiTop + win) s_wifiTop = s_wifiSel - (win-1);
+    if (s_wifiTop < 0) s_wifiTop = 0;
+    if (s_wifiSel == -1) s_wifiTop = 0;
+  }
 
   if (Buttons::select.consume()) {
-    if (count > 0) {
+    // Header toggles view
+    if (s_wifiSel == -1) {
+      s_wifiSavedView = !s_wifiSavedView;
+      s_wifiSel = s_wifiSavedView ? 0 : 0;
+      s_wifiTop = 0;
+      wifiRenderAll();
+      return;
+    }
+
+    if (s_wifiSavedView) {
+      if (!wifiSvcHasSavedCreds()) {
+        notifySvcPost(NOTIFY_WARN, "WIFI", "NO SAVED", 1200);
+      } else if (s_wifiSel == 0) {
+        wifiSvcConnectSaved();
+        notifySvcPost(NOTIFY_INFO, "WIFI", "Connect saved", 1500);
+      } else if (s_wifiSel == 1) {
+        wifiSvcForget();
+        notifySvcPost(NOTIFY_WARN, "WIFI", "Forgot", 1200);
+      }
+      wifiRenderAll();
+      return;
+    }
+
+    // Scan view
+    if (count > 0 && s_wifiSel >= 0) {
       const WifiSvcNet* net = wifiSvcScanResult(s_wifiSel);
       const char* selSsid = net ? net->ssid : nullptr;
 
@@ -287,16 +385,20 @@ static void appWifiTick() {
         wifiSvcDisconnect();
         notifySvcPost(NOTIFY_WARN, "WIFI", "Disconnect", 1200);
       } else if (selSsid && wifiSvcHasCredsFor(selSsid)) {
-        // We only support connecting with saved creds (no on-watch typing yet).
-        // wifiSvcConnectSaved() connects to the saved SSID/pass pair.
+        // Single saved network: connects only for saved SSID.
         wifiSvcConnectSaved();
         notifySvcPost(NOTIFY_INFO, "WIFI", "Connect saved", 1500);
       } else if (selSsid && net && net->auth == WIFI_AUTH_OPEN) {
-        // Allow open networks with an empty password.
         wifiSvcConnect(selSsid, "");
         notifySvcPost(NOTIFY_INFO, "WIFI", "Connect open", 1500);
-      } else {
-        notifySvcPost(NOTIFY_WARN, "WIFI", "NO CREDS", 1500);
+      } else if (selSsid && net) {
+        // Secured, missing creds -> keyboard
+        strncpy(s_wifiSelSsid, selSsid, sizeof(s_wifiSelSsid)-1);
+        s_wifiSelSsid[sizeof(s_wifiSelSsid)-1] = '\0';
+        s_wifiPass[0] = '\0';
+        kbStart("WIFI PASS", s_wifiPass, (uint8_t)sizeof(s_wifiPass), true);
+        notifySvcPost(NOTIFY_INFO, "WIFI", "Enter pass", 900);
+        return;
       }
     }
   }
@@ -680,6 +782,35 @@ static void appSystemEnter() {
   appChromeEnter("SYSTEM", "STATUS", "BACK menu");
 }
 
+// Alien-style bars for SYSTEM/SENS pages (row-level redraw)
+static void drawBarRow(int row, const char* label, float value, float vmin, float vmax, uint16_t col) {
+  char txt[32];
+  snprintf(txt, sizeof(txt), "%s", label);
+  drawLine(row, false, txt);
+
+  int x0 = 120;
+  int y0 = BODY_Y + row*LINE_H;
+  int w  = 240 - x0 - 10;
+  int h  = LINE_H;
+
+  tft.fillRect(x0, y0, w, h, COL_DARK());
+
+  float t = 0.0f;
+  if (vmax > vmin) t = (value - vmin) / (vmax - vmin);
+  if (t < 0) t = 0;
+  if (t > 1) t = 1;
+  int bw = (int)(t * (float)w);
+  if (bw > 0) tft.fillRect(x0, y0, bw, h, col);
+
+  char vbuf[20];
+  if (vmax >= 1000) snprintf(vbuf, sizeof(vbuf), "%.0f", value);
+  else snprintf(vbuf, sizeof(vbuf), "%.1f", value);
+  tft.setTextSize(1);
+  tft.setTextColor(COL_FG(), COL_BG());
+  tft.setCursor(x0 + 2, y0 + 2);
+  tft.print(vbuf);
+}
+
 static void appSystemTick() {
   // Pages: 0=PERF, 1=SENS, 2=RFID/NFC
   static int s_page = 0;
@@ -703,42 +834,49 @@ static void appSystemTick() {
   }
 
   if (s_page == 0) {
-    // PERF
-    char l0[48];
-    snprintf(l0, sizeof(l0), "FPS:%d CPU:%d%%", perfGetFps(), perfGetCpuPercent());
-    drawLine(0, false, l0);
-
-    snprintf(l0, sizeof(l0), "Draw:%d Loop:%lu", perfGetDrawCount(), (unsigned long)perfGetLoopCount());
-    drawLine(1, false, l0);
+    // PERF (Alien bars)
+    drawBarRow(0, "CPU%", (float)perfGetCpuPercent(), 0, 100, COL_HILITE());
+    drawBarRow(1, "FPS",  (float)perfGetFps(),        0, 60,  COL_DIM());
+    drawBarRow(2, "DRAW", (float)perfGetDrawCount(),  0, 400, COL_DIM());
 
     const char* ip = wifiSvcGetIP(); if (!ip) ip = "";
-    char l2[48];
-    snprintf(l2, sizeof(l2), "IP:%s", ip);
-    drawLine(2, false, l2);
+    char l3[48];
+    snprintf(l3, sizeof(l3), "IP:%s", ip);
+    drawLine(3, false, l3);
 
-    snprintf(l2, sizeof(l2), "SD:%s Payloads:%d", sdPresent ? "Y" : "N", (int)payloadCount);
-    drawLine(3, false, l2);
+    char l4[48];
+    snprintf(l4, sizeof(l4), "SD:%s Payloads:%d", sdPresent ? "Y" : "N", (int)payloadCount);
+    drawLine(4, false, l4);
 
-    drawLine(4, false, "UP/DN: Pages");
-    drawLine(5, false, "");
+    drawLine(5, false, "UP/DN: Pages");
   } else if (s_page == 1) {
-    // SENSORS
-    char a[48];
-    airSvcGetSummary(a, (int)sizeof(a));
-    drawLine(0, false, a);
+    // SENSORS (threshold bands)
+    const float TEMP_WARN_F = 95.0f;
+    const float TEMP_BAD_F  = 110.0f;
+    const float AIR_SAFE_MAX = 1000.0f;
+    const float AIR_WARN_MAX = 1500.0f;
 
-    char t[48];
-    tempIrGetSummary(t, (int)sizeof(t));
-    drawLine(1, false, t);
+    float objF = 0.0f;
+    float ambF = 0.0f;
+    if (tempIrHasData()) {
+      objF = tempIrObjectC() * 9.0f/5.0f + 32.0f;
+      ambF = tempIrAmbientC() * 9.0f/5.0f + 32.0f;
+    }
+    uint16_t tcol = COL_OK();
+    if (objF >= TEMP_BAD_F) tcol = COL_BAD();
+    else if (objF >= TEMP_WARN_F) tcol = COL_WARN();
+    drawBarRow(0, "IR OBJ F", objF, 60, 140, tcol);
+    drawBarRow(1, "IR AMB F", ambF, 40, 110, COL_DIM());
 
-    // Raw values (useful even in demo mode)
-    char l2[48];
-    snprintf(l2, sizeof(l2), "CO2:%uppm L:%d", (unsigned)airSvcCO2ppm(), (int)airSvcAlertLevel());
-    drawLine(2, false, l2);
+    float co2 = (float)airSvcCO2ppm();
+    uint16_t acol = COL_OK();
+    if (co2 >= AIR_WARN_MAX) acol = COL_BAD();
+    else if (co2 >= AIR_SAFE_MAX) acol = COL_WARN();
+    drawBarRow(2, "CO2 PPM", co2, 400, 2000, acol);
 
-    snprintf(l2, sizeof(l2), "OBJ:%.1fC AMB:%.1fC", tempIrObjectC(), tempIrAmbientC());
-    drawLine(3, false, l2);
-
+    char l3[48];
+    snprintf(l3, sizeof(l3), "AIR LVL:%d", (int)airSvcAlertLevel());
+    drawLine(3, false, l3);
     drawLine(4, false, "UP/DN: Pages");
     drawLine(5, false, "");
   } else {
@@ -794,8 +932,9 @@ void appsTick() {
 
   if (runningApp < 0 || runningApp >= APP_COUNT) return;
 
-  // BACK: haptic + call app exit, then start slide-out transition
-  if (Buttons::back.consume()) {
+  // BACK: normally exits app. If the rotary keyboard is active, BACK is reserved
+  // for the keyboard (cancel/confirm) and must not exit the app.
+  if (!kbActive() && Buttons::back.consume()) {
     if (fxSound) hapticsPattern(HAPTIC_CLICK);
     if (apps[runningApp].exit) apps[runningApp].exit();
     exitAppTransition();
